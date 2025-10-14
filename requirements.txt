@@ -1,4 +1,4 @@
-stablepy==0.6.2
+stablepy==0.6.4
 torch==2.5.1
 diffusers
 gdown
