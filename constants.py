@@ -321,16 +321,6 @@ DIFFUSERS_CONTROLNET_MODEL = [
     # "InstantX/FLUX.1-dev-Controlnet-Canny",
 ]
 
-PROMPT_W_OPTIONS = [
-    ("Compel format: (word)weight", "Compel"),
-    ("Classic format: (word:weight)", "Classic"),
-    ("Classic-original format: (word:weight)", "Classic-original"),
-    ("Classic-no_norm format: (word:weight)", "Classic-no_norm"),
-    ("Classic-sd_embed format: (word:weight)", "Classic-sd_embed"),
-    ("Classic-ignore", "Classic-ignore"),
-    ("None", "None"),
-]
-
 WARNING_MSG_VAE = (
     "Use the right VAE for your model to maintain image quality. The wrong"
     " VAE can lead to poor results, like blurriness in the generated images."

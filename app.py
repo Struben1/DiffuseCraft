@@ -9,6 +9,7 @@ from stablepy import (
     TASK_AND_PREPROCESSORS,
     FACE_RESTORATION_MODELS,
     scheduler_names,
+    PROMPT_WEIGHT_OPTIONS_PRIORITY,
 )
 from constants import (
     DIRECTORY_MODELS,
@@ -28,7 +29,6 @@ from constants import (
     TASK_MODEL_LIST,
     UPSCALER_DICT_GUI,
     UPSCALER_KEYS,
-    PROMPT_W_OPTIONS,
     WARNING_MSG_VAE,
     SDXL_TASK,
     MODEL_TYPE_TASK,
@@ -975,7 +975,7 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
                     )
 
                 num_images_gui = gr.Slider(minimum=1, maximum=(8 if IS_ZERO_GPU else 20), step=1, value=1, label="Images")
-                prompt_syntax_gui = gr.Dropdown(label="Prompt Syntax", choices=PROMPT_W_OPTIONS, value=PROMPT_W_OPTIONS[1][1])
+                prompt_syntax_gui = gr.Dropdown(label="Prompt Syntax", choices=PROMPT_WEIGHT_OPTIONS_PRIORITY, value=PROMPT_WEIGHT_OPTIONS_PRIORITY[0])
                 vae_model_gui = gr.Dropdown(label="VAE Model", choices=vae_model_list, value=vae_model_list[0])
 
                 with gr.Accordion("Hires fix", open=False, visible=True):
