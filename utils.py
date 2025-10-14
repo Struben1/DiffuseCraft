@@ -13,8 +13,7 @@ from constants import (
     CACHE_HF,
     STORAGE_ROOT,
 )
-from huggingface_hub import HfApi
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, get_hf_file_metadata, snapshot_download
 from diffusers import DiffusionPipeline
 from huggingface_hub import model_info as model_info_data
 from diffusers.pipelines.pipeline_loading_utils import variant_compatible_siblings
@@ -28,9 +27,154 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 import shutil
 import subprocess
+import json
+import html as _html
 
 IS_ZERO_GPU = bool(os.getenv("SPACES_ZERO_GPU"))
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0'
+MODEL_ARCH = {
+    'stable-diffusion-xl-v1-base/lora': "Stable Diffusion XL (Illustrious, Pony, NoobAI)",
+    'stable-diffusion-v1/lora': "Stable Diffusion 1.5",
+    'flux-1-dev/lora': "Flux",
+}
+
+
+def read_safetensors_header_from_url(url: str):
+    """Read safetensors header from a remote Hugging Face file."""
+    meta = get_hf_file_metadata(url)
+
+    # Step 1: first 8 bytes → header length
+    resp = requests.get(meta.location, headers={"Range": "bytes=0-7"})
+    resp.raise_for_status()
+    header_len = int.from_bytes(resp.content, "little")
+
+    # Step 2: fetch full header JSON
+    end = 8 + header_len - 1
+    resp = requests.get(meta.location, headers={"Range": f"bytes=8-{end}"})
+    resp.raise_for_status()
+    header_json = resp.content.decode("utf-8")
+
+    return json.loads(header_json)
+
+
+def read_safetensors_header_from_file(path: str):
+    """Read safetensors header from a local file."""
+    with open(path, "rb") as f:
+        # Step 1: first 8 bytes → header length
+        header_len = int.from_bytes(f.read(8), "little")
+
+        # Step 2: read header JSON
+        header_json = f.read(header_len).decode("utf-8")
+
+    return json.loads(header_json)
+
+
+class LoraHeaderInformation:
+    """
+    Encapsulates parsed info from a LoRA JSON header and provides
+    a compact HTML summary via .to_html().
+    """
+
+    def __init__(self, json_data):
+        self.original_json = copy.deepcopy(json_data or {})
+
+        # Check if text encoder was trained
+        # guard for json_data being a mapping
+        try:
+            self.text_encoder_trained = any("text_model" in ln for ln in json_data)
+        except Exception:
+            self.text_encoder_trained = False
+
+        # Metadata (may be None)
+        metadata = (json_data or {}).get("__metadata__", None)
+        self.metadata = metadata
+
+        # Default values
+        self.architecture = "undefined"
+        self.prediction_type = "undefined"
+        self.base_model = "undefined"
+        self.author = "undefined"
+        self.title = "undefined"
+        self.common_tags_list = []
+
+        if metadata:
+            self.architecture = MODEL_ARCH.get(
+                metadata.get('modelspec.architecture', None),
+                "undefined"
+            )
+
+            self.prediction_type = metadata.get('modelspec.prediction_type', "undefined")
+            self.base_model = metadata.get('ss_sd_model_name', "undefined")
+            self.author = metadata.get('modelspec.author', "undefined")
+            self.title = metadata.get('modelspec.title', "undefined")
+
+            base_model_hash = metadata.get('ss_new_sd_model_hash', None)  # SHA256
+            # AUTOV1 ss_sd_model_hash
+            # https://civitai.com/api/v1/model-versions/by-hash/{base_model_hash}  # Info
+            if base_model_hash:
+                self.base_model += f" hash={base_model_hash}"
+
+            # Extract tags
+            try:
+                tags = metadata.get('ss_tag_frequency') if "ss_tag_frequency" in metadata else metadata.get('ss_datasets', "")
+                tags = json.loads(tags) if tags else ""
+
+                if isinstance(tags, list):
+                    tags = tags[0].get("tag_frequency", {})
+
+                if tags:
+                    self.common_tags_list = list(tags[list(tags.keys())[0]].keys())
+            except Exception:
+                self.common_tags_list = []
+
+    def to_dict(self):
+        """Return a plain dict summary of parsed fields."""
+        return {
+            "architecture": self.architecture,
+            "prediction_type": self.prediction_type,
+            "base_model": self.base_model,
+            "author": self.author,
+            "title": self.title,
+            "text_encoder_trained": bool(self.text_encoder_trained),
+            "common_tags": self.common_tags_list,
+        }
+
+    def to_html(self, limit_tags=20):
+        """
+        Return a compact HTML snippet (string) showing the parsed info
+        in a small font. Values are HTML-escaped.
+        """
+        # helper to escape
+        esc = _html.escape
+
+        rows = [
+            ("Title", esc(str(self.title))),
+            ("Author", esc(str(self.author))),
+            ("Architecture", esc(str(self.architecture))),
+            ("Base model", esc(str(self.base_model))),
+            ("Prediction type", esc(str(self.prediction_type))),
+            ("Text encoder trained", esc(str(self.text_encoder_trained))),
+            ("Reference tags", esc(str(", ".join(self.common_tags_list[:limit_tags])))),
+        ]
+
+        # small, compact table with inline styling (small font)
+        html_rows = "".join(
+            f"<tr><th style='text-align:left;padding:2px 6px;white-space:nowrap'>{k}</th>"
+            f"<td style='padding:2px 6px'>{v}</td></tr>"
+            for k, v in rows
+        )
+
+        html_snippet = (
+            "<div style='font-family:system-ui, -apple-system, \"Segoe UI\", Roboto, "
+            "Helvetica, Arial, \"Noto Sans\", sans-serif; font-size:12px; line-height:1.2; "
+            "'>"
+            f"<table style='border-collapse:collapse; font-size:12px;'>"
+            f"{html_rows}"
+            "</table>"
+            "</div>"
+        )
+
+        return html_snippet
 
 
 def request_json_data(url):
@@ -325,6 +469,14 @@ def get_my_lora(link_url, romanize):
         msg_lora += f": <b>{l_name}</b>"
         print(msg_lora)
 
+    try:
+        # Works with non-Civitai loras.
+        json_data = read_safetensors_header_from_file(l_name)
+        metadata_lora = LoraHeaderInformation(json_data)
+        msg_lora += "<br>" + metadata_lora.to_html()
+    except Exception:
+        pass
+
     return gr.update(
         choices=new_lora_model_list
     ), gr.update(
@@ -523,11 +675,11 @@ def clear_hf_cache():
     Hugging Face will re-download models as needed later.
     """
     try:
-        if os.path.exists(CACHE_HF_ROOT):
-            shutil.rmtree(CACHE_HF_ROOT, ignore_errors=True)
-            print(f"Hugging Face cache cleared: {CACHE_HF_ROOT}")
+        if os.path.exists(CACHE_HF):
+            shutil.rmtree(CACHE_HF, ignore_errors=True)
+            print(f"Hugging Face cache cleared: {CACHE_HF}")
         else:
-            print(f"No Hugging Face cache found at: {CACHE_HF_ROOT}")
+            print(f"No Hugging Face cache found at: {CACHE_HF}")
     except Exception as e:
         print(f"Error clearing Hugging Face cache: {e}")
 

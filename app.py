@@ -42,6 +42,7 @@ from constants import (
     IP_MODELS,
     MODE_IP_OPTIONS,
     CACHE_HF_ROOT,
+    CACHE_HF,
 )
 from stablepy.diffusers_vanilla.style_prompt_config import STYLE_NAMES
 import torch
@@ -76,6 +77,7 @@ from diffusers import FluxPipeline
 import subprocess
 
 IS_ZERO_GPU = bool(os.getenv("SPACES_ZERO_GPU"))
+HIDE_API = bool(os.getenv("HIDE_API"))
 if IS_ZERO_GPU:
     subprocess.run("rm -rf /data-nvme/zerogpu-offload/*", env={}, shell=True)
 IS_GPU_MODE = True if IS_ZERO_GPU else (True if torch.cuda.is_available() else False)
@@ -172,7 +174,7 @@ class GuiSD:
         self.last_load = datetime.now()
         self.inventory = []
 
-    def update_storage_models(self, storage_floor_gb=24, required_inventory_for_purge=3):
+    def update_storage_models(self, storage_floor_gb=30, required_inventory_for_purge=3):
         while get_used_storage_gb() > storage_floor_gb:
             if len(self.inventory) < required_inventory_for_purge:
                 break
@@ -181,7 +183,7 @@ class GuiSD:
 
         # Cleanup after 60 seconds of inactivity
         lowPrioCleanup = max((datetime.now() - self.last_load).total_seconds(), 0) > 60
-        if lowPrioCleanup and not self.status_loading and get_used_storage_gb(CACHE_HF_ROOT) > (storage_floor_gb * 2):
+        if lowPrioCleanup and (len(self.inventory) >= required_inventory_for_purge - 1) and not self.status_loading and get_used_storage_gb(CACHE_HF_ROOT) > (storage_floor_gb * 2):
             print("Cleaning up Hugging Face cache...")
             clear_hf_cache()
             self.inventory = [
@@ -972,7 +974,7 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
                         run_set_random_seed, [], seed_gui
                     )
 
-                num_images_gui = gr.Slider(minimum=1, maximum=(5 if IS_ZERO_GPU else 20), step=1, value=1, label="Images")
+                num_images_gui = gr.Slider(minimum=1, maximum=(8 if IS_ZERO_GPU else 20), step=1, value=1, label="Images")
                 prompt_syntax_gui = gr.Dropdown(label="Prompt Syntax", choices=PROMPT_W_OPTIONS, value=PROMPT_W_OPTIONS[1][1])
                 vae_model_gui = gr.Dropdown(label="VAE Model", choices=vae_model_list, value=vae_model_list[0])
 
@@ -997,7 +999,7 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
                         return gr.Dropdown(label=label, choices=lora_model_list, value="None", allow_custom_value=True, visible=visible)
 
                     def lora_scale_slider(label, visible=True):
-                        val_lora = 2 if IS_ZERO_GPU else 8
+                        val_lora = 8 if IS_ZERO_GPU else 10
                         return gr.Slider(minimum=-val_lora, maximum=val_lora, step=0.01, value=0.33, label=label, visible=visible)
 
                     lora1_gui = lora_dropdown("Lora1")
@@ -1360,6 +1362,7 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
         outputs=[load_model_gui],
         queue=True,
         show_progress="minimal",
+        api_name=(False if HIDE_API else None),
     ).success(
         fn=sd_gen_generate_pipeline,  # fn=sd_gen.generate_pipeline,
         inputs=[
@@ -1488,6 +1491,7 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
         outputs=[load_model_gui, result_images, actual_task_info],
         queue=True,
         show_progress="minimal",
+        # api_name=(False if HIDE_API else None),
     )
 
 if __name__ == "__main__":
@@ -1498,4 +1502,5 @@ if __name__ == "__main__":
         debug=True,
         ssr_mode=args.ssr,
         allowed_paths=[allowed_path],
+        show_api=(not HIDE_API),
     )
