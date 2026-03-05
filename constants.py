@@ -18,11 +18,11 @@ DOWNLOAD_MODEL = "https://huggingface.co/TechnoByte/MilkyWonderland/resolve/main
 DOWNLOAD_VAE = "https://huggingface.co/fp16-guy/anything_kl-f8-anime2_vae-ft-mse-840000-ema-pruned_blessed_clearvae_fp16_cleaned/resolve/main/vae-ft-mse-840000-ema-pruned_fp16.safetensors?download=true"
 
 # - **Download LoRAs**
-DOWNLOAD_LORA = "https://huggingface.co/Leopain/color/resolve/main/Coloring_book_-_LineArt.safetensors, https://civitai.com/api/download/models/1712900?type=Model&format=SafeTensor, https://civitai.com/api/download/models/773211?type=Model&format=SafeTensor, https://civitai.com/api/download/models/135867, https://huggingface.co/Linaqruf/anime-detailer-xl-lora/resolve/main/anime-detailer-xl.safetensors?download=true, https://huggingface.co/Linaqruf/style-enhancer-xl-lora/resolve/main/style-enhancer-xl.safetensors?download=true, https://huggingface.co/ByteDance/Hyper-SD/resolve/main/Hyper-SD15-8steps-CFG-lora.safetensors?download=true, https://huggingface.co/ByteDance/Hyper-SD/resolve/main/Hyper-SDXL-8steps-CFG-lora.safetensors?download=true"
+DOWNLOAD_LORA = "https://civitai.com/api/download/models/2624290?type=Model&format=SafeTensor, https://civitai.com/api/download/models/1712900?type=Model&format=SafeTensor, https://civitai.com/api/download/models/773211?type=Model&format=SafeTensor, https://civitai.com/api/download/models/135867, https://civitai.com/api/download/models/2327805?type=Model&format=SafeTensor, https://civitai.com/api/download/models/1952321?type=Model&format=SafeTensor, https://civitai.com/api/download/models/1494022?type=Model&format=SafeTensor, https://civitai.com/api/download/models/2313223?type=Model&format=SafeTensor, https://civitai.com/api/download/models/1896899?type=Model&format=SafeTensor"
 
 LOAD_DIFFUSERS_FORMAT_MODEL = [
     'stabilityai/stable-diffusion-xl-base-1.0',
-    'Laxhar/noobai-XL-1.1',
+    'votepurchase/pornmasterPro_noobV3VAE',
     'Laxhar/noobai-XL-Vpred-1.0',
     'black-forest-labs/FLUX.1-dev',
     'black-forest-labs/FLUX.1-Krea-dev',
