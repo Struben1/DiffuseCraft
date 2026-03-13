@@ -275,7 +275,7 @@ DIFFUSERS_CONTROLNET_MODEL = [
     "Eugeoter/noob-sdxl-controlnet-manga_line",
     "Eugeoter/noob-sdxl-controlnet-lineart_realistic",
     "Eugeoter/noob-sdxl-controlnet-depth_midas-v1-1",
-    "dimitribarbot/controlnet-openpose-sdxl-1.0-safetensors",
+    "raulc0399/flux_dev_openpose_controlnet",
     "r3gm/controlnet-openpose-sdxl-1.0-fp16",
     "r3gm/controlnet-canny-scribble-integrated-sdxl-v2-fp16",
     "r3gm/controlnet-union-sdxl-1.0-fp16",
