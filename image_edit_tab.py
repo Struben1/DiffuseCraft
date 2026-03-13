@@ -1,76 +1,33 @@
 """
 image_edit_tab.py  -  DiffuseCraft Image Editing Tab
-Model: prithivMLmods/FireRed-Image-Edit-1.0-8bit
-
-Requires latest diffusers from GitHub. The Colab notebook handles this automatically.
+Uses the official FireRed-Image-Edit HF Space API via gradio_client.
+No local model loading = no diffusers version conflict with stablepy.
 """
 
-import gc
 import random
+import tempfile
+import os
 
 import gradio as gr
 import numpy as np
-import torch
 from PIL import Image
-from huggingface_hub import snapshot_download
 
-MODEL_ID = "prithivMLmods/FireRed-Image-Edit-1.0-8bit"
-MAX_SEED  = np.iinfo(np.int32).max
+MAX_SEED = np.iinfo(np.int32).max
 
-_edit_pipe      = None
-_edit_transformer = None
+# The official public HF Space
+HF_SPACE = "prithivMLmods/FireRed-Image-Edit-1.0-Fast"
 
 
-def download_edit_model():
-    """Pre-download the model from Hugging Face at startup."""
-    try:
-        print(f"[ImageEdit] Downloading {MODEL_ID} ...")
-        snapshot_download(
-            repo_id=MODEL_ID,
-            ignore_patterns=["*.msgpack", "*.h5", "flax_model*"],
-        )
-        print("[ImageEdit] Download complete.")
-    except Exception as e:
-        print(f"[ImageEdit] Download warning (will retry on first use): {e}")
+def _get_client():
+    from gradio_client import Client
+    return Client(HF_SPACE)
 
 
-def load_edit_pipeline():
-    """Load (or return cached) pipeline."""
-    global _edit_pipe, _edit_transformer
-    if _edit_pipe is not None:
-        return _edit_pipe
-
-    from diffusers.models import QwenImageTransformer2DModel
-    from diffusers import QwenImageEditPlusPipeline
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype  = torch.bfloat16
-
-    print("[ImageEdit] Loading transformer...")
-    _edit_transformer = QwenImageTransformer2DModel.from_pretrained(
-        MODEL_ID,
-        subfolder="transformer",
-        torch_dtype=dtype,
-    )
-
-    print("[ImageEdit] Loading pipeline...")
-    _edit_pipe = QwenImageEditPlusPipeline.from_pretrained(
-        MODEL_ID,
-        transformer=_edit_transformer,
-        torch_dtype=dtype,
-    ).to(device)
-
-    print("[ImageEdit] Pipeline ready.")
-    return _edit_pipe
-
-
-def _get_dimensions(pil_image):
-    w, h = pil_image.size
-    if w > h:
-        new_w, new_h = 1024, int(1024 * h / w)
-    else:
-        new_h, new_w = 1024, int(1024 * w / h)
-    return max(8, (new_w // 8) * 8), max(8, (new_h // 8) * 8)
+def _pil_to_tempfile(pil_image):
+    """Save a PIL image to a temp file and return the path."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    pil_image.save(tmp.name)
+    return tmp.name
 
 
 def _load_gallery_images(gallery):
@@ -100,53 +57,59 @@ def run_image_edit(
     num_inference_steps,
     progress=gr.Progress(track_tqdm=True),
 ):
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     pil_images = _load_gallery_images(gallery)
     if not pil_images:
         raise gr.Error("Please upload at least one image.")
     if not prompt.strip():
         raise gr.Error("Please enter an edit instruction.")
 
-    pipe   = load_edit_pipeline()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
 
-    generator     = torch.Generator(device=device).manual_seed(int(seed))
-    width, height = _get_dimensions(pil_images[0])
+    # Save images to temp files so gradio_client can upload them
+    temp_paths = [_pil_to_tempfile(img) for img in pil_images]
 
-    negative_prompt = (
-        "worst quality, low quality, bad anatomy, bad hands, "
-        "text, error, missing fingers, extra digit, fewer digits, "
-        "cropped, jpeg artifacts, signature, watermark, username, blurry"
-    )
+    try:
+        client = _get_client()
 
-    result = pipe(
-        image=pil_images,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=height,
-        width=width,
-        num_inference_steps=num_inference_steps,
-        true_cfg_scale=guidance_scale,
-        generator=generator,
-    ).images[0]
+        result = client.predict(
+            images=temp_paths,
+            prompt=prompt,
+            seed=seed,
+            randomize_seed=False,
+            guidance_scale=guidance_scale,
+            steps=num_inference_steps,
+            api_name="/infer",
+        )
 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # result is (output_image_path, seed_used)
+        output_path = result[0] if isinstance(result, (list, tuple)) else result
+        output_seed = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else seed
 
-    return result, seed
+        output_image = Image.open(output_path).convert("RGB")
+        return output_image, output_seed
+
+    except Exception as e:
+        raise gr.Error(f"Image edit failed: {str(e)}")
+    finally:
+        # Clean up temp files
+        for path in temp_paths:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
+def download_edit_model():
+    """No-op — model runs on HF Space, nothing to download locally."""
+    print("[ImageEdit] Using HF Space API — no local download needed.")
 
 
 def image_edit_tab():
-    gr.Markdown("### 🖊️ Image Edit — FireRed-Image-Edit-1.0 (8bit)")
+    gr.Markdown("### 🖊️ Image Edit — FireRed-Image-Edit-1.0 (via HF Space)")
     gr.Markdown(
         "Upload **1–3 images** and describe your edit. "
+        "Uses the official FireRed HF Space — no local GPU needed for this tab. "
         "For multi-image edits, reference images by number "
         "*(e.g. 'Replace her glasses with the glasses from image 2')*."
     )
@@ -191,4 +154,4 @@ def image_edit_tab():
     )
 
     return gallery
-       
+    
