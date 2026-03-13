@@ -1,6 +1,6 @@
 stablepy==0.6.4
 torch==2.5.1
-diffusers
+git+https://github.com/huggingface/diffusers
 gdown
 opencv-python
 unidecode
