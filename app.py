@@ -66,6 +66,7 @@ from utils import (
     clear_hf_cache,
 )
 from image_processor import preprocessor_tab
+from image_edit_tab import image_edit_tab
 from datetime import datetime
 import gradio as gr
 import logging
@@ -1350,6 +1351,23 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
 
     with gr.Tab("Preprocessor", render=True):
         preprocessor_tab()
+    with gr.Tab("🖊️ Image Edit"):
+        edit_input_image = image_edit_tab()
+    with gr.Column():
+                result_up_tab = gr.Image(label="Result", type="pil", interactive=False, format="png")
+
+                generate_button_up_tab.click(
+                    fn=process_upscale,
+                    inputs=[image_up_tab, upscaler_tab, upscaler_size_tab],
+                    outputs=[result_up_tab],
+                )
+                # ↓ ADD THIS ↓
+                send_to_edit_btn = gr.Button("📤 Send to Image Edit")
+                send_to_edit_btn.click(
+                    fn=lambda img: img,
+                    inputs=[result_up_tab],
+                    outputs=[edit_input_image],
+                )
 
     generate_button.click(
         fn=sd_gen.load_new_model,
