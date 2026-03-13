@@ -1,5 +1,7 @@
 import spaces
 import os
+from image_edit_tab import image_edit_tab, download_edit_model
+download_edit_model()  # add this right after the import
 from argparse import ArgumentParser
 from stablepy import (
     Model_Diffusers,
