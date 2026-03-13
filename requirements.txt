@@ -11,3 +11,8 @@ hf_xet
 spaces
 gradio==5.44.1
 matplotlib-inline
+transformers
+peft
+accelerate
+qwen-vl-utils
+av
