@@ -16,5 +16,3 @@ peft
 accelerate
 qwen-vl-utils
 av
-sentencepiece
-kernels
