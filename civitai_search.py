@@ -1,9 +1,12 @@
 """
 civitai_search.py — Civitai LoRA Search for DiffuseCraft
-- NSFW enabled
-- Image card grid
-- Downloads use same aria2c method as DiffuseCraft's download_things
-- Auto-refreshes LoRA dropdowns after download
+Fixes:
+- Accurate name search (no tag param)
+- 3 cards per row
+- Pagination (10 per page)
+- Compressed preview images via Civitai CDN resize
+- Horizontal scroll within panel (no page scroll needed)
+- NSFW on
 """
 
 import requests
@@ -11,22 +14,49 @@ import subprocess
 import os
 import re
 
-CIVITAI_API = "https://civitai.com/api/v1/models"
+CIVITAI_API  = "https://civitai.com/api/v1/models"
+PAGE_SIZE    = 10   # results per page
 
 
-def search_civitai_loras(query, search_by, api_key="", limit=20):
+def compress_image_url(url, width=200):
+    """
+    Use Civitai's CDN to serve a compressed/resized preview.
+    Civitai uses imagedelivery.net or media.civitai.com — append width param.
+    """
+    if not url:
+        return url
+    # Civitai CDN supports /width= suffix
+    if "image.civitai.com" in url or "imagedelivery" in url:
+        # Remove existing size params and add our own
+        url = re.sub(r'/width=\d+', '', url)
+        url = re.sub(r'\?.*$', '', url)
+        return f"{url}/width={width}"
+    return url
+
+
+def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SIZE):
+    """
+    Search Civitai LoRAs by name or creator.
+    Returns (all_results, status_message, total_pages).
+    """
     params = {
         "types":  "LORA",
-        "limit":  limit,
+        "limit":  page_size,
+        "page":   page,
         "sort":   "Highest Rated",
-        "nsfw":   "true",
         "period": "AllTime",
+        # nsfw — Civitai requires account token to unlock NSFW results
+        # passing nsfw=true works when api_key is provided
     }
+
     if search_by == "Creator":
         params["username"] = query.strip()
     else:
+        # Name-only search — most accurate, matches Civitai website behaviour
         params["query"] = query.strip()
-        params["tag"]   = query.strip()
+
+    if api_key and api_key.strip():
+        params["nsfw"] = "true"
 
     headers = {}
     if api_key and api_key.strip():
@@ -37,22 +67,14 @@ def search_civitai_loras(query, search_by, api_key="", limit=20):
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        return [], f"❌ Search failed: {e}"
+        return [], f"❌ Search failed: {e}", 1
 
-    items = data.get("items", [])
-
-    # Fallback: name-only search if tag+name returns nothing
-    if not items and search_by != "Creator":
-        params.pop("tag", None)
-        try:
-            resp  = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            items = resp.json().get("items", [])
-        except Exception:
-            pass
+    items      = data.get("items", [])
+    metadata   = data.get("metadata", {})
+    total_pages = max(1, metadata.get("totalPages", 1))
 
     if not items:
-        return [], "No LoRAs found. Try different keywords."
+        return [], f"No LoRAs found for '{query}'. Try different keywords.", 1
 
     results = []
     for item in items:
@@ -62,8 +84,8 @@ def search_civitai_loras(query, search_by, api_key="", limit=20):
         latest = versions[0]
         files  = latest.get("files", [])
 
-        download_url = None
-        file_size_kb = 0
+        download_url  = None
+        file_size_kb  = 0
         orig_filename = ""
         for f in files:
             if f.get("primary") or f.get("name", "").endswith(".safetensors"):
@@ -75,7 +97,9 @@ def search_civitai_loras(query, search_by, api_key="", limit=20):
             download_url = latest.get("downloadUrl", "")
 
         images      = latest.get("images", [])
-        preview_url = next((img["url"] for img in images if img.get("url")), "")
+        raw_preview = next((img["url"] for img in images if img.get("url")), "")
+        # Compress preview to 200px wide — fast loading
+        preview_url = compress_image_url(raw_preview, width=200)
 
         desc = re.sub(r"<[^>]+>", "", item.get("description") or "").strip()
         desc = desc[:300] + "..." if len(desc) > 300 else desc
@@ -100,26 +124,23 @@ def search_civitai_loras(query, search_by, api_key="", limit=20):
             "nsfw":          item.get("nsfw", False),
         })
 
-    return results, f"✅ Found {len(results)} LoRA(s)."
+    total_found = metadata.get("totalItems", len(results))
+    msg = f"✅ Page {page}/{total_pages} — {total_found:,} total results for '{query}'"
+    return results, msg, total_pages
 
 
 def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
-    """
-    Download using aria2c exactly like DiffuseCraft's download_things.
-    Uses the original filename from Civitai so it matches what DiffuseCraft expects.
-    """
+    """Download LoRA using aria2c (same as DiffuseCraft), falls back to requests."""
     os.makedirs(directory, exist_ok=True)
 
     url = result.get("download_url", "")
     if not url:
         return None, "❌ No download URL available."
 
-    # Append API key if not already in URL
     if civitai_api_key and civitai_api_key.strip() and "token=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}token={civitai_api_key.strip()}"
 
-    # Use original filename from Civitai if available, otherwise derive from name
     if result.get("orig_filename") and result["orig_filename"].endswith(".safetensors"):
         filename = result["orig_filename"]
     else:
@@ -127,150 +148,203 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
         filename  = f"{safe_name}.safetensors"
 
     output_path = os.path.join(directory, filename)
+    print(f"[CivitaiSearch] Downloading {filename} → {directory}")
 
-    print(f"[CivitaiSearch] Downloading {filename} to {directory}...")
-
-    # Try aria2c first (same as DiffuseCraft download_things)
     try:
         cmd = [
-            "aria2c",
-            "--console-log-level=error",
+            "aria2c", "--console-log-level=error",
             "-c", "-x", "16", "-s", "16", "-k", "1M",
-            "--out", filename,
-            url,
-            "-d", directory,
+            "--out", filename, url, "-d", directory,
         ]
-        result_proc = subprocess.run(cmd, capture_output=True, text=True)
-        if result_proc.returncode == 0 and os.path.exists(output_path):
-            print(f"[CivitaiSearch] ✅ Saved: {output_path}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0 and os.path.exists(output_path):
             return output_path, f"✅ Downloaded: {filename}\nPath: {output_path}"
     except FileNotFoundError:
-        pass  # aria2c not available, fall back
+        pass
 
-    # Fallback: requests streaming download
+    # Fallback: requests streaming
     try:
         headers = {"User-Agent": "DiffuseCraft/1.0"}
-        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        with requests.get(url, headers=headers, stream=True, timeout=120) as r:
             r.raise_for_status()
-            # Check if server gives a better filename
             cd = r.headers.get("Content-Disposition", "")
             if "filename=" in cd:
                 import cgi
                 _, params = cgi.parse_header(cd)
-                server_filename = params.get("filename", "").strip('"')
-                if server_filename.endswith(".safetensors"):
-                    filename    = server_filename
+                srv_fn = params.get("filename", "").strip('"')
+                if srv_fn.endswith(".safetensors"):
+                    filename    = srv_fn
                     output_path = os.path.join(directory, filename)
-
             with open(output_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=65536):
                     f.write(chunk)
-
-        print(f"[CivitaiSearch] ✅ Saved: {output_path}")
         return output_path, f"✅ Downloaded: {filename}\nPath: {output_path}"
-
     except Exception as e:
         return None, f"❌ Download failed: {e}"
 
 
-def format_results_html(results):
+def format_results_html(results, current_page=1, total_pages=1):
+    """
+    Render results as 3-per-row image cards.
+    Includes page info at top.
+    """
     if not results:
         return "<p style='color:#aaa; padding:10px;'>No results.</p>"
 
     cards = ""
     for i, r in enumerate(results):
-        img_src    = r["preview_url"] or "https://placehold.co/165x220/1a1a2e/888?text=No+Preview"
-        nsfw_badge = ("<span style='background:#c0392b; color:#fff; font-size:0.65em; "
-                      "padding:2px 5px; border-radius:4px; margin-left:3px;'>NSFW</span>"
-                      if r["nsfw"] else "")
+        num     = (current_page - 1) * PAGE_SIZE + i + 1
+        img_src = r["preview_url"] or "https://placehold.co/140x190/1a1a2e/888?text=No+Preview"
+        nsfw_badge = (
+            "<span style='background:#c0392b;color:#fff;font-size:0.6em;"
+            "padding:1px 4px;border-radius:3px;margin-left:3px;'>NSFW</span>"
+            if r["nsfw"] else ""
+        )
+        base_color = {
+            "Illustrious": "#4a9eff",
+            "SDXL 1.0": "#7c6af7",
+            "Pony": "#f7a06a",
+            "SD 1.5": "#6af7a0",
+            "FLUX": "#f76a6a",
+        }.get(r["base_model"], "#7c9")
+
         cards += f"""
-        <div style="display:inline-block; vertical-align:top; width:165px; margin:6px;
-                    border-radius:10px; overflow:hidden; background:#1e1e2e;
-                    border:2px solid #333; font-family:sans-serif; cursor:pointer;"
-             onmouseover="this.style.borderColor='#7c6af7'; this.style.transform='scale(1.03)';"
-             onmouseout="this.style.borderColor='#333'; this.style.transform='scale(1)';">
+        <div style="
+            width:calc(33.33% - 10px); min-width:130px; max-width:180px;
+            border-radius:10px; overflow:hidden; background:#1e1e2e;
+            border:2px solid #2a2a3e; font-family:sans-serif; cursor:pointer;
+            transition:border-color 0.15s, transform 0.15s; flex-shrink:0;
+        "
+        onmouseover="this.style.borderColor='#7c6af7';this.style.transform='scale(1.03)';"
+        onmouseout="this.style.borderColor='#2a2a3e';this.style.transform='scale(1)';">
             <div style="position:relative;">
-                <img src="{img_src}" style="width:100%; height:220px; object-fit:cover; display:block;"
-                     onerror="this.src='https://placehold.co/165x220/1a1a2e/888?text=No+Image'"/>
-                <div style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.75);
-                            color:#fff; font-size:0.8em; font-weight:bold;
-                            padding:2px 7px; border-radius:8px;">#{i+1}</div>
+                <img src="{img_src}"
+                     style="width:100%;height:190px;object-fit:cover;display:block;"
+                     loading="lazy"
+                     onerror="this.src='https://placehold.co/140x190/1a1a2e/888?text=No+Image'"/>
+                <div style="
+                    position:absolute;top:5px;left:5px;
+                    background:rgba(0,0,0,0.8);color:#fff;
+                    font-size:0.75em;font-weight:bold;
+                    padding:2px 6px;border-radius:6px;
+                ">#{num}</div>
             </div>
-            <div style="padding:8px;">
-                <div style="font-weight:bold; font-size:0.82em; color:#e0e0e0;
-                            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
-                     title="{r['name']}">{r['name']}{nsfw_badge}</div>
-                <div style="font-size:0.73em; color:#aaa;">👤 {r['creator']}</div>
-                <div style="font-size:0.72em; color:#7c9;">🏗️ {r['base_model']}</div>
-                <div style="font-size:0.70em; color:#888; margin-top:2px;">
-                    ⬇️ {r['downloads']:,} &nbsp; ⭐ {r['rating']} ({r['rating_count']})
+            <div style="padding:7px;">
+                <div style="
+                    font-weight:bold;font-size:0.78em;color:#e0e0e0;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                " title="{r['name']}">{r['name']}{nsfw_badge}</div>
+                <div style="font-size:0.68em;color:#aaa;margin-top:1px;">👤 {r['creator']}</div>
+                <div style="font-size:0.67em;margin-top:1px;">
+                    <span style="color:{base_color};">🏗️ {r['base_model']}</span>
+                </div>
+                <div style="font-size:0.65em;color:#888;margin-top:2px;">
+                    ⬇️ {r['downloads']:,} &nbsp; ⭐ {r['rating']}
                 </div>
             </div>
         </div>"""
 
+    page_info = f"Page {current_page} of {total_pages}"
+
     return f"""
-    <div style="background:#111827; padding:12px; border-radius:12px; overflow:auto;">
-        <div style="display:flex; flex-wrap:wrap; gap:2px;">{cards}</div>
-        <p style="color:#666; font-size:0.78em; margin-top:8px; padding-left:4px;">
-            💡 Type a result number below to see full details & trigger words, then download.
-        </p>
+    <div style="background:#0f1117;padding:12px;border-radius:12px;">
+        <div style="color:#666;font-size:0.78em;margin-bottom:8px;padding-left:2px;">
+            📄 {page_info} &nbsp;·&nbsp;
+            💡 Type a result number below to see details & trigger words
+        </div>
+        <div style="
+            display:flex;flex-wrap:wrap;gap:8px;
+            max-height:620px;overflow-y:auto;
+            padding-right:4px;
+        ">
+            {cards}
+        </div>
     </div>"""
 
 
 def format_detail_html(result):
+    """Show full detail card for a selected LoRA."""
     if not result:
         return ""
 
     if result["trigger_words"]:
         tags = "".join([
-            f"<span style='background:#2d2d4e; color:#c9b8ff; padding:3px 10px; "
-            f"border-radius:12px; margin:3px 2px; display:inline-block; "
-            f"font-size:0.85em; border:1px solid #4a4a6e;'>{t}</span>"
+            f"<span style='background:#2d2d4e;color:#c9b8ff;padding:3px 10px;"
+            f"border-radius:12px;margin:3px 2px;display:inline-block;"
+            f"font-size:0.85em;border:1px solid #4a4a6e;'>{t}</span>"
             for t in result["trigger_words"]
         ])
         trigger_section = f"""
         <div style='margin-top:12px;'>
-            <div style='color:#888; font-size:0.82em; margin-bottom:5px; font-weight:bold;'>🎯 TRIGGER WORDS</div>
+            <div style='color:#888;font-size:0.82em;margin-bottom:5px;font-weight:bold;letter-spacing:0.05em;'>
+                🎯 TRIGGER WORDS
+            </div>
             <div>{tags}</div>
         </div>"""
     else:
-        trigger_section = "<div style='color:#666; font-size:0.82em; margin-top:8px;'>🎯 No trigger words listed.</div>"
+        trigger_section = "<div style='color:#555;font-size:0.82em;margin-top:10px;'>🎯 No trigger words listed.</div>"
 
-    img_src    = result["preview_url"] or "https://placehold.co/160x210/1a1a2e/888?text=No+Image"
-    nsfw_badge = ("<span style='background:#c0392b; color:#fff; font-size:0.72em; "
-                  "padding:2px 6px; border-radius:4px;'>NSFW</span> " if result["nsfw"] else "")
-    size_str   = f"{result['file_size_kb']/1024:.1f} MB" if result["file_size_kb"] else "Unknown"
-    fname      = result.get("orig_filename") or f"{result['name'][:40]}.safetensors"
+    img_src    = result["preview_url"] or "https://placehold.co/150x200/1a1a2e/888?text=No+Image"
+    nsfw_badge = (
+        "<span style='background:#c0392b;color:#fff;font-size:0.72em;"
+        "padding:2px 6px;border-radius:4px;margin-right:6px;'>NSFW</span>"
+        if result["nsfw"] else ""
+    )
+    size_str = f"{result['file_size_kb']/1024:.1f} MB" if result["file_size_kb"] else "Unknown"
+    fname    = result.get("orig_filename") or f"{result['name'][:40]}.safetensors"
 
     return f"""
-    <div style='background:#1a1a2e; border:1px solid #444; border-radius:12px;
-                padding:16px; display:flex; gap:16px; flex-wrap:wrap; font-family:sans-serif; margin-top:6px;'>
-        <img src="{img_src}" style='width:160px; height:210px; object-fit:cover; border-radius:8px; flex-shrink:0;'
-             onerror="this.src='https://placehold.co/160x210/1a1a2e/888?text=No+Image'"/>
-        <div style='flex:1; min-width:180px;'>
-            <div style='font-size:1.1em; font-weight:bold; color:#e0e0e0; margin-bottom:2px;'>
-                {nsfw_badge}{result['name']}
+    <div style='
+        background:#13131f;border:1px solid #333;border-radius:12px;
+        padding:14px;display:flex;gap:14px;flex-wrap:wrap;
+        font-family:sans-serif;margin-top:6px;
+    '>
+        <img src="{img_src}"
+             style='width:150px;height:200px;object-fit:cover;border-radius:8px;flex-shrink:0;'
+             onerror="this.src='https://placehold.co/150x200/1a1a2e/888?text=No+Image'"/>
+        <div style='flex:1;min-width:160px;'>
+            <div style='font-size:1.05em;font-weight:bold;color:#e0e0e0;margin-bottom:2px;'>
+                {nsfw_badge}{result["name"]}
             </div>
-            <div style='font-size:0.8em; color:#888; margin-bottom:10px;'>{result['version_name']}</div>
-            <div style='display:grid; grid-template-columns:auto 1fr; gap:4px 12px; font-size:0.85em;'>
-                <span style='color:#888;'>👤 Creator</span>
-                <span style='color:#ddd;'>{result['creator']}</span>
-                <span style='color:#888;'>🏗️ Base Model</span>
-                <span><span style='background:#1a3a1a; color:#90ee90; padding:2px 8px; border-radius:8px; font-size:0.9em;'>{result['base_model']}</span></span>
-                <span style='color:#888;'>⬇️ Downloads</span>
-                <span style='color:#ddd;'>{result['downloads']:,}</span>
-                <span style='color:#888;'>⭐ Rating</span>
-                <span style='color:#ddd;'>{result['rating']} <span style='color:#666;'>({result['rating_count']} reviews)</span></span>
-                <span style='color:#888;'>💾 Size</span>
-                <span style='color:#ddd;'>{size_str}</span>
-                <span style='color:#888;'>📄 File</span>
-                <span style='color:#bbb; font-size:0.85em; word-break:break-all;'>{fname}</span>
+            <div style='font-size:0.78em;color:#666;margin-bottom:10px;'>{result["version_name"]}</div>
+
+            <div style='display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:0.83em;'>
+                <span style='color:#666;'>👤 Creator</span>
+                <span style='color:#ccc;'>{result["creator"]}</span>
+
+                <span style='color:#666;'>🏗️ Base</span>
+                <span>
+                    <span style='background:#1a2a3a;color:#7ab;padding:1px 7px;border-radius:6px;font-size:0.9em;'>
+                        {result["base_model"]}
+                    </span>
+                </span>
+
+                <span style='color:#666;'>⬇️ Downloads</span>
+                <span style='color:#ccc;'>{result["downloads"]:,}</span>
+
+                <span style='color:#666;'>⭐ Rating</span>
+                <span style='color:#ccc;'>
+                    {result["rating"]}
+                    <span style='color:#555;font-size:0.88em;'>({result["rating_count"]} reviews)</span>
+                </span>
+
+                <span style='color:#666;'>💾 Size</span>
+                <span style='color:#ccc;'>{size_str}</span>
+
+                <span style='color:#666;'>📄 File</span>
+                <span style='color:#aaa;font-size:0.82em;word-break:break-all;'>{fname}</span>
             </div>
+
             {trigger_section}
-            <div style='margin-top:10px; font-size:0.8em; color:#888; line-height:1.5;'>{result['description']}</div>
-            <div style='margin-top:12px;'>
-                <a href='{result['model_url']}' target='_blank'
-                   style='color:#7c6af7; font-size:0.85em; text-decoration:none;'>🔗 View on Civitai →</a>
+
+            <div style='margin-top:10px;font-size:0.78em;color:#777;line-height:1.6;'>
+                {result["description"]}
             </div>
+
+            <a href='{result["model_url"]}' target='_blank'
+               style='display:inline-block;margin-top:12px;color:#7c6af7;font-size:0.83em;text-decoration:none;'>
+                🔗 View on Civitai →
+            </a>
         </div>
     </div>"""
+        
