@@ -66,6 +66,7 @@ from utils import (
     clear_hf_cache,
 )
 from image_processor import preprocessor_tab
+from civitai_search import search_civitai_loras, download_lora_from_result, format_results_html
 from datetime import datetime
 import gradio as gr
 import logging
@@ -801,6 +802,13 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
                     [task_gui],
                 )
 
+                civitai_api_key_gui = gr.Textbox(
+                    label="🔑 Civitai API Key (for LoRA search & download)",
+                    placeholder="Paste your Civitai API key here",
+                    type="password",
+                    value=CIVITAI_API_KEY,
+                )
+
                 load_model_gui = gr.HTML(elem_id="load_model", elem_classes="contain")
 
                 result_images = gr.Gallery(
@@ -1031,6 +1039,64 @@ with gr.Blocks(theme=args.theme, css=CSS, fill_width=True, fill_height=False) as
                             get_my_lora,
                             [text_lora, romanize_text],
                             [lora1_gui, lora2_gui, lora3_gui, lora4_gui, lora5_gui, lora6_gui, lora7_gui, new_lora_status]
+                        )
+
+                    with gr.Accordion("🔍 Search Civitai LoRAs", open=False, visible=True):
+                        gr.Markdown("Search for LoRAs on Civitai by name or creator, preview info, then download.")
+                        with gr.Row():
+                            civitai_search_query = gr.Textbox(
+                                label="Search term",
+                                placeholder="e.g. 'anime style' or a creator username",
+                                scale=3,
+                            )
+                            civitai_search_by = gr.Radio(
+                                ["Name", "Creator"],
+                                value="Name",
+                                label="Search by",
+                                scale=1,
+                            )
+                        civitai_search_btn    = gr.Button("🔍 Search Civitai", variant="primary")
+                        civitai_search_status = gr.HTML()
+                        civitai_results_html  = gr.HTML()
+                        civitai_results_state = gr.State([])
+
+                        gr.Markdown("**Select a result by number to download it:**")
+                        with gr.Row():
+                            civitai_result_index  = gr.Number(label="Result # to download", value=1, minimum=1, precision=0, scale=1)
+                            civitai_dl_btn        = gr.Button("⬇️ Download Selected LoRA", variant="secondary", scale=2)
+                        civitai_dl_status = gr.Textbox(label="Download Status", interactive=False)
+
+                        def do_civitai_search(query, search_by, api_key):
+                            if not query.strip():
+                                return "<p style='color:orange'>⚠️ Please enter a search term.</p>", [], "Empty search."
+                            results, msg = search_civitai_loras(query, search_by, api_key, limit=10)
+                            html = format_results_html(results)
+                            return html, results, msg
+
+                        def do_civitai_download(results, index, api_key):
+                            if not results:
+                                return "❌ No results — search first."
+                            idx = int(index) - 1
+                            if idx < 0 or idx >= len(results):
+                                return f"❌ Pick a number between 1 and {len(results)}."
+                            # Inject API key into download URL if not already there
+                            result = dict(results[idx])
+                            if api_key and api_key.strip() and "token=" not in result.get("download_url", ""):
+                                url = result["download_url"]
+                                sep = "&" if "?" in url else "?"
+                                result["download_url"] = f"{url}{sep}token={api_key.strip()}"
+                            _, msg = download_lora_from_result(result, DIRECTORY_LORAS)
+                            return msg
+
+                        civitai_search_btn.click(
+                            fn=do_civitai_search,
+                            inputs=[civitai_search_query, civitai_search_by, civitai_api_key_gui],
+                            outputs=[civitai_results_html, civitai_results_state, civitai_search_status],
+                        )
+                        civitai_dl_btn.click(
+                            fn=do_civitai_download,
+                            inputs=[civitai_results_state, civitai_result_index, civitai_api_key_gui],
+                            outputs=[civitai_dl_status],
                         )
 
                 with gr.Accordion("Face restoration", open=False, visible=True):
