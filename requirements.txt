@@ -16,3 +16,4 @@ peft
 accelerate
 qwen-vl-utils
 av
+requests
