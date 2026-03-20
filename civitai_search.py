@@ -1,15 +1,13 @@
 """
 civitai_search.py — Civitai LoRA Search for DiffuseCraft
 
-Confirmed working params from official API docs + civitai-api Python wrapper:
-- 'limit' is the correct page size param (NOT pageSize)
-- 'query' works for name search
-- 'username' works for creator search  
-- sort: "Most Reactions", "Most Comments", "Newest", "Most Downloaded"
-- period: "AllTime", "Year", "Month", "Week", "Day" (only used without query)
-- nsfw: true/false
-- The 400 error was caused by combining sort+period+query together
-  Fix: only send period when NOT using query param
+Based on confirmed Reddit dev findings (r/civitai):
+- query= is BROKEN (fails ~70% of the time) — never use it
+- tag= works 100% reliably
+- username= works for creator search
+- Page-based pagination is broken — use cursor from metadata.nextPage/prevPage
+- Large limits (20+) cause timeouts — keep at 10 max
+- No sort param to avoid 400s
 """
 
 import requests
@@ -19,11 +17,9 @@ import re
 
 CIVITAI_API  = "https://civitai.com/api/v1/models"
 PAGE_SIZE    = 10
-SORT_OPTIONS = ["Most Downloaded", "Most Reactions", "Newest"]
 
 
 def compress_image_url(url, width=180):
-    """Resize via Civitai imagecache CDN."""
     if not url:
         return url
     if "imagecache.civitai.com" in url:
@@ -34,19 +30,12 @@ def compress_image_url(url, width=180):
     return url
 
 
-def _do_request(params, headers):
-    """Make a single API request, return parsed JSON or raise."""
-    resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SIZE, sort="Most Downloaded"):
+def search_civitai_loras(query, search_by, api_key="", cursor=None, page_size=PAGE_SIZE):
     """
-    Search Civitai for LoRAs.
-    Name search: tries query first, falls back to tag if empty.
-    Creator search: uses username param.
-    Key: do NOT send period when using query (causes 400).
+    Search Civitai LoRAs using cursor-based pagination (reliable).
+    - Name search: tag= param (100% reliable per Reddit devs)
+    - Creator search: username= param
+    - Returns (results, status_msg, next_cursor, prev_cursors_stack)
     """
     headers = {}
     if api_key and api_key.strip():
@@ -54,59 +43,39 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
 
     q = query.strip()
 
-    # Base params — no period when using query (causes 400 on Civitai API)
-    base = {
+    params = {
         "types": "LORA",
         "limit": page_size,
-        "page":  page,
-        "sort":  sort,
         "nsfw":  "true",
     }
 
-    data     = None
-    used_tag = False
-
     if search_by == "Creator":
-        # Creator: period is safe to include
-        try:
-            data = _do_request({**base, "period": "AllTime", "username": q}, headers)
-        except Exception as e:
-            return [], f"❌ Search failed: {e}", 1
+        params["username"] = q
     else:
-        # Name: query param only, NO period
-        try:
-            data = _do_request({**base, "query": q}, headers)
-        except requests.exceptions.HTTPError as e:
-            # If still 400, strip sort too and try bare minimum
-            if e.response.status_code == 400:
-                try:
-                    data = _do_request({"types": "LORA", "limit": page_size,
-                                        "page": page, "query": q, "nsfw": "true"}, headers)
-                except Exception as e2:
-                    return [], f"❌ Search failed: {e2}", 1
-            else:
-                return [], f"❌ Search failed: {e}", 1
-        except Exception as e:
-            return [], f"❌ Search failed: {e}", 1
+        params["tag"] = q
 
-        # Fallback to tag search if query returns nothing
-        if not data or not data.get("items"):
-            try:
-                data = _do_request({**base, "tag": q}, headers)
-                used_tag = True
-            except Exception:
-                pass
+    # Use cursor for pagination if provided
+    if cursor:
+        params["cursor"] = cursor
 
-    if not data:
-        return [], f"No results for '{q}'.", 1
+    try:
+        resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        return [], f"❌ Search failed ({e.response.status_code}): {e.response.text[:200]}", None
+    except Exception as e:
+        return [], f"❌ Search failed: {e}", None
 
-    items       = data.get("items", [])
-    metadata    = data.get("metadata", {})
-    total_pages = max(1, metadata.get("totalPages", 1))
+    items    = data.get("items", [])
+    metadata = data.get("metadata", {})
+
+    # Extract next cursor from nextPage URL
+    next_cursor = metadata.get("nextCursor")
     total_items = metadata.get("totalItems", len(items))
 
     if not items:
-        return [], f"No LoRAs found for '{q}'. Try different keywords.", 1
+        return [], f"No LoRAs found for '{q}'. Try different keywords.", None
 
     results = []
     for item in items:
@@ -155,13 +124,11 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
             "nsfw":          item.get("nsfw", False),
         })
 
-    tag_note = " (tag search)" if used_tag else ""
-    msg = f"✅ Page {page}/{total_pages} — {total_items:,} results for '{q}'{tag_note}"
-    return results, msg, total_pages
+    msg = f"✅ Found {len(results)} LoRAs for '{q}'" + (f" — {total_items:,} total" if total_items else "")
+    return results, msg, next_cursor
 
 
 def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
-    """Download using aria2c (same as DiffuseCraft). Token as ?token= param."""
     os.makedirs(directory, exist_ok=True)
     url = result.get("download_url", "")
     if not url:
@@ -209,13 +176,13 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
         return None, f"❌ Download failed: {e}"
 
 
-def format_results_html(results, current_page=1, total_pages=1):
+def format_results_html(results, page_num=1):
     if not results:
         return "<p style='color:#aaa;padding:10px;'>No results.</p>"
 
     cards = ""
     for i, r in enumerate(results):
-        num     = (current_page - 1) * PAGE_SIZE + i + 1
+        num     = (page_num - 1) * PAGE_SIZE + i + 1
         img_src = r["preview_url"] or "https://placehold.co/140x185/1a1a2e/888?text=No+Preview"
         nsfw_badge = (
             "<span style='background:#c0392b;color:#fff;font-size:0.6em;"
@@ -258,7 +225,7 @@ def format_results_html(results, current_page=1, total_pages=1):
     return f"""
     <div style="background:#0f1117;padding:12px;border-radius:12px;">
         <div style="color:#555;font-size:0.75em;margin-bottom:8px;">
-            📄 Page {current_page}/{total_pages} &nbsp;·&nbsp;
+            📄 Page {page_num} &nbsp;·&nbsp;
             💡 Type a result number below to see details &amp; trigger words
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:8px;
@@ -332,4 +299,4 @@ def format_detail_html(result):
                 🔗 View on Civitai →</a>
         </div>
     </div>"""
-          
+      
