@@ -19,14 +19,21 @@ CIVITAI_API  = "https://civitai.com/api/v1/models"
 PAGE_SIZE    = 10
 
 
-def compress_image_url(url, width=180):
-    if not url:
+def compress_image_url(url, width=120):
+    """
+    Compress Civitai preview images via their CDN.
+    Works for both imagecache.civitai.com and image.civitai.com.
+    Width=120 gives fast-loading thumbnails good enough for the card grid.
+    """
+    if not url or "civitai.com" not in url:
         return url
-    if "imagecache.civitai.com" in url:
-        url = re.sub(r'/width=\d+', f'/width={width}', url)
-        if f'/width={width}' not in url:
-            parts = url.rsplit('/', 1)
-            url = f"{parts[0]}/width={width}/{parts[1]}"
+    # Strip any existing width or original directive
+    url = re.sub(r'/width=\d+', '', url)
+    url = re.sub(r'/original=true', '', url)
+    # Insert /width=N before the filename (last path segment)
+    parts = url.rsplit('/', 1)
+    if len(parts) == 2:
+        url = f"{parts[0]}/width={width}/{parts[1]}"
     return url
 
 
@@ -299,4 +306,4 @@ def format_detail_html(result):
                 🔗 View on Civitai →</a>
         </div>
     </div>"""
-      
+                
