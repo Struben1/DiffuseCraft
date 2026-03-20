@@ -1,12 +1,18 @@
 """
 civitai_search.py — Civitai LoRA Search for DiffuseCraft
-Fixes:
-- Accurate name search (no tag param)
-- 3 cards per row
-- Pagination (10 per page)
-- Compressed preview images via Civitai CDN resize
-- Horizontal scroll within panel (no page scroll needed)
-- NSFW on
+
+Based on official Civitai REST API Reference (updated Dec 2025):
+https://github.com/civitai/civitai/wiki/REST-API-Reference#get-apiv1models
+
+GET /api/v1/models params:
+  limit, page, query, tag, username, types, sort, period, nsfw
+  sort values: "Most Reactions", "Most Comments", "Newest", "Most Downloaded"
+  period values: "AllTime", "Year", "Month", "Week", "Day"
+  nsfw: boolean true/false
+
+Image CDN: imagecache.civitai.com/.../width=N/filename for compression
+
+Auth: Bearer token in header + ?token= in download URLs (S3 strips headers)
 """
 
 import requests
@@ -14,67 +20,95 @@ import subprocess
 import os
 import re
 
-CIVITAI_API  = "https://civitai.com/api/v1/models"
-PAGE_SIZE    = 10   # results per page
+CIVITAI_API = "https://civitai.com/api/v1/models"
+PAGE_SIZE   = 10
 
 
-def compress_image_url(url, width=200):
-    """
-    Use Civitai's CDN to serve a compressed/resized preview.
-    Civitai uses imagedelivery.net or media.civitai.com — append width param.
-    """
+def compress_image_url(url, width=180):
+    """Resize via Civitai's imagecache CDN."""
     if not url:
         return url
-    # Civitai CDN supports /width= suffix
-    if "image.civitai.com" in url or "imagedelivery" in url:
-        # Remove existing size params and add our own
-        url = re.sub(r'/width=\d+', '', url)
-        url = re.sub(r'\?.*$', '', url)
-        return f"{url}/width={width}"
+    if "imagecache.civitai.com" in url:
+        url = re.sub(r'/width=\d+', f'/width={width}', url)
+        if f'/width={width}' not in url:
+            parts = url.rsplit('/', 1)
+            url = f"{parts[0]}/width={width}/{parts[1]}"
     return url
 
 
 def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SIZE):
     """
-    Search Civitai LoRAs by name or creator.
-    Returns (all_results, status_message, total_pages).
+    Search Civitai for LoRAs using the official API.
+    - Name:    uses 'query' param (correct per official docs)
+    - Creator: uses 'username' param
+    sort='Most Downloaded', period='AllTime', nsfw=true
+    Returns (results, status_message, total_pages).
     """
+    headers = {}
+    if api_key and api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+
+    q = query.strip()
+
+    # Base params — only valid values per official docs
     params = {
         "types":  "LORA",
         "limit":  page_size,
         "page":   page,
-        "sort":   "Highest Rated",
+        "sort":   "Most Downloaded",
         "period": "AllTime",
-        # nsfw — Civitai requires account token to unlock NSFW results
-        # passing nsfw=true works when api_key is provided
+        "nsfw":   "true",
     }
 
     if search_by == "Creator":
-        params["username"] = query.strip()
+        params["username"] = q
     else:
-        # Name-only search — most accurate, matches Civitai website behaviour
-        params["query"] = query.strip()
-
-    if api_key and api_key.strip():
-        params["nsfw"] = "true"
-
-    headers = {}
-    if api_key and api_key.strip():
-        headers["Authorization"] = f"Bearer {api_key.strip()}"
+        params["query"] = q
 
     try:
         resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code
+        # If 400, retry without period param (some older API versions don't like it with query)
+        if status == 400:
+            params.pop("period", None)
+            try:
+                resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e2:
+                return [], f"❌ Search failed: {e2}", 1
+        else:
+            return [], f"❌ Search failed ({status}): {e}", 1
     except Exception as e:
         return [], f"❌ Search failed: {e}", 1
 
-    items      = data.get("items", [])
-    metadata   = data.get("metadata", {})
+    items       = data.get("items", [])
+    metadata    = data.get("metadata", {})
     total_pages = max(1, metadata.get("totalPages", 1))
+    total_items = metadata.get("totalItems", len(items))
 
     if not items:
-        return [], f"No LoRAs found for '{query}'. Try different keywords.", 1
+        # Fallback: try tag search if query returned nothing
+        if search_by != "Creator":
+            try:
+                params2 = dict(params)
+                params2.pop("query", None)
+                params2["tag"] = q
+                resp2 = requests.get(CIVITAI_API, params=params2, headers=headers, timeout=15)
+                resp2.raise_for_status()
+                data2       = resp2.json()
+                items       = data2.get("items", [])
+                metadata    = data2.get("metadata", {})
+                total_pages = max(1, metadata.get("totalPages", 1))
+                total_items = metadata.get("totalItems", len(items))
+            except Exception:
+                pass
+
+    if not items:
+        return [], f"No LoRAs found for '{q}'. Try different keywords.", 1
 
     results = []
     for item in items:
@@ -96,10 +130,10 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
         if not download_url:
             download_url = latest.get("downloadUrl", "")
 
+        # Compressed preview image (180px wide)
         images      = latest.get("images", [])
         raw_preview = next((img["url"] for img in images if img.get("url")), "")
-        # Compress preview to 200px wide — fast loading
-        preview_url = compress_image_url(raw_preview, width=200)
+        preview_url = compress_image_url(raw_preview, width=180)
 
         desc = re.sub(r"<[^>]+>", "", item.get("description") or "").strip()
         desc = desc[:300] + "..." if len(desc) > 300 else desc
@@ -124,19 +158,22 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
             "nsfw":          item.get("nsfw", False),
         })
 
-    total_found = metadata.get("totalItems", len(results))
-    msg = f"✅ Page {page}/{total_pages} — {total_found:,} total results for '{query}'"
+    msg = f"✅ Page {page}/{total_pages} — {total_items:,} total results for '{q}'"
     return results, msg, total_pages
 
 
 def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
-    """Download LoRA using aria2c (same as DiffuseCraft), falls back to requests."""
+    """
+    Download LoRA using aria2c (same as DiffuseCraft), falls back to requests.
+    Token passed as ?token= in URL (required for S3 redirects) AND in header.
+    """
     os.makedirs(directory, exist_ok=True)
 
     url = result.get("download_url", "")
     if not url:
         return None, "❌ No download URL available."
 
+    # Must add token as query param — S3 redirects strip headers
     if civitai_api_key and civitai_api_key.strip() and "token=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}token={civitai_api_key.strip()}"
@@ -150,6 +187,7 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
     output_path = os.path.join(directory, filename)
     print(f"[CivitaiSearch] Downloading {filename} → {directory}")
 
+    # aria2c first (same as DiffuseCraft download_things)
     try:
         cmd = [
             "aria2c", "--console-log-level=error",
@@ -164,16 +202,16 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
 
     # Fallback: requests streaming
     try:
-        headers = {"User-Agent": "DiffuseCraft/1.0"}
-        with requests.get(url, headers=headers, stream=True, timeout=120) as r:
+        hdrs = {"User-Agent": "DiffuseCraft/1.0"}
+        with requests.get(url, headers=hdrs, stream=True, timeout=120) as r:
             r.raise_for_status()
             cd = r.headers.get("Content-Disposition", "")
             if "filename=" in cd:
                 import cgi
-                _, params = cgi.parse_header(cd)
-                srv_fn = params.get("filename", "").strip('"')
-                if srv_fn.endswith(".safetensors"):
-                    filename    = srv_fn
+                _, cgi_params = cgi.parse_header(cd)
+                srv = cgi_params.get("filename", "").strip('"')
+                if srv.endswith(".safetensors"):
+                    filename    = srv
                     output_path = os.path.join(directory, filename)
             with open(output_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
@@ -184,86 +222,68 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
 
 
 def format_results_html(results, current_page=1, total_pages=1):
-    """
-    Render results as 3-per-row image cards.
-    Includes page info at top.
-    """
+    """3-per-row card grid with compressed preview images and internal scroll."""
     if not results:
-        return "<p style='color:#aaa; padding:10px;'>No results.</p>"
+        return "<p style='color:#aaa;padding:10px;'>No results.</p>"
 
     cards = ""
     for i, r in enumerate(results):
         num     = (current_page - 1) * PAGE_SIZE + i + 1
-        img_src = r["preview_url"] or "https://placehold.co/140x190/1a1a2e/888?text=No+Preview"
+        img_src = r["preview_url"] or "https://placehold.co/140x185/1a1a2e/888?text=No+Preview"
         nsfw_badge = (
             "<span style='background:#c0392b;color:#fff;font-size:0.6em;"
             "padding:1px 4px;border-radius:3px;margin-left:3px;'>NSFW</span>"
             if r["nsfw"] else ""
         )
-        base_color = {
-            "Illustrious": "#4a9eff",
-            "SDXL 1.0": "#7c6af7",
-            "Pony": "#f7a06a",
-            "SD 1.5": "#6af7a0",
-            "FLUX": "#f76a6a",
-        }.get(r["base_model"], "#7c9")
+        base_colors = {
+            "Illustrious": "#4a9eff", "SDXL 1.0": "#7c6af7",
+            "Pony": "#f7a06a", "SD 1.5": "#6af7a0", "FLUX": "#f76a6a",
+        }
+        base_color = base_colors.get(r["base_model"], "#7c9")
 
         cards += f"""
-        <div style="
-            width:calc(33.33% - 10px); min-width:130px; max-width:180px;
-            border-radius:10px; overflow:hidden; background:#1e1e2e;
-            border:2px solid #2a2a3e; font-family:sans-serif; cursor:pointer;
-            transition:border-color 0.15s, transform 0.15s; flex-shrink:0;
-        "
-        onmouseover="this.style.borderColor='#7c6af7';this.style.transform='scale(1.03)';"
-        onmouseout="this.style.borderColor='#2a2a3e';this.style.transform='scale(1)';">
+        <div style="width:calc(33.33% - 10px);min-width:120px;max-width:175px;
+                    border-radius:10px;overflow:hidden;background:#1e1e2e;
+                    border:2px solid #2a2a3e;font-family:sans-serif;cursor:pointer;
+                    transition:border-color 0.15s,transform 0.15s;"
+             onmouseover="this.style.borderColor='#7c6af7';this.style.transform='scale(1.03)';"
+             onmouseout="this.style.borderColor='#2a2a3e';this.style.transform='scale(1)';">
             <div style="position:relative;">
                 <img src="{img_src}"
-                     style="width:100%;height:190px;object-fit:cover;display:block;"
+                     style="width:100%;height:185px;object-fit:cover;display:block;"
                      loading="lazy"
-                     onerror="this.src='https://placehold.co/140x190/1a1a2e/888?text=No+Image'"/>
-                <div style="
-                    position:absolute;top:5px;left:5px;
-                    background:rgba(0,0,0,0.8);color:#fff;
-                    font-size:0.75em;font-weight:bold;
-                    padding:2px 6px;border-radius:6px;
-                ">#{num}</div>
+                     onerror="this.src='https://placehold.co/140x185/1a1a2e/888?text=No+Image'"/>
+                <div style="position:absolute;top:5px;left:5px;background:rgba(0,0,0,0.8);
+                            color:#fff;font-size:0.72em;font-weight:bold;
+                            padding:2px 6px;border-radius:6px;">#{num}</div>
             </div>
             <div style="padding:7px;">
-                <div style="
-                    font-weight:bold;font-size:0.78em;color:#e0e0e0;
-                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                " title="{r['name']}">{r['name']}{nsfw_badge}</div>
+                <div style="font-weight:bold;font-size:0.78em;color:#e0e0e0;
+                            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+                     title="{r['name']}">{r['name']}{nsfw_badge}</div>
                 <div style="font-size:0.68em;color:#aaa;margin-top:1px;">👤 {r['creator']}</div>
-                <div style="font-size:0.67em;margin-top:1px;">
-                    <span style="color:{base_color};">🏗️ {r['base_model']}</span>
-                </div>
+                <div style="font-size:0.67em;margin-top:1px;color:{base_color};">🏗️ {r['base_model']}</div>
                 <div style="font-size:0.65em;color:#888;margin-top:2px;">
                     ⬇️ {r['downloads']:,} &nbsp; ⭐ {r['rating']}
                 </div>
             </div>
         </div>"""
 
-    page_info = f"Page {current_page} of {total_pages}"
-
     return f"""
     <div style="background:#0f1117;padding:12px;border-radius:12px;">
-        <div style="color:#666;font-size:0.78em;margin-bottom:8px;padding-left:2px;">
-            📄 {page_info} &nbsp;·&nbsp;
-            💡 Type a result number below to see details & trigger words
+        <div style="color:#555;font-size:0.75em;margin-bottom:8px;">
+            📄 Page {current_page}/{total_pages} &nbsp;·&nbsp;
+            💡 Type a result number below to see details &amp; trigger words
         </div>
-        <div style="
-            display:flex;flex-wrap:wrap;gap:8px;
-            max-height:620px;overflow-y:auto;
-            padding-right:4px;
-        ">
+        <div style="display:flex;flex-wrap:wrap;gap:8px;
+                    max-height:600px;overflow-y:auto;padding-right:4px;">
             {cards}
         </div>
     </div>"""
 
 
 def format_detail_html(result):
-    """Show full detail card for a selected LoRA."""
+    """Full detail card with trigger words, stats, preview image."""
     if not result:
         return ""
 
@@ -276,13 +296,12 @@ def format_detail_html(result):
         ])
         trigger_section = f"""
         <div style='margin-top:12px;'>
-            <div style='color:#888;font-size:0.82em;margin-bottom:5px;font-weight:bold;letter-spacing:0.05em;'>
-                🎯 TRIGGER WORDS
-            </div>
+            <div style='color:#888;font-size:0.8em;font-weight:bold;
+                        letter-spacing:0.05em;margin-bottom:5px;'>🎯 TRIGGER WORDS</div>
             <div>{tags}</div>
         </div>"""
     else:
-        trigger_section = "<div style='color:#555;font-size:0.82em;margin-top:10px;'>🎯 No trigger words listed.</div>"
+        trigger_section = "<div style='color:#555;font-size:0.8em;margin-top:10px;'>🎯 No trigger words listed.</div>"
 
     img_src    = result["preview_url"] or "https://placehold.co/150x200/1a1a2e/888?text=No+Image"
     nsfw_badge = (
@@ -294,11 +313,9 @@ def format_detail_html(result):
     fname    = result.get("orig_filename") or f"{result['name'][:40]}.safetensors"
 
     return f"""
-    <div style='
-        background:#13131f;border:1px solid #333;border-radius:12px;
-        padding:14px;display:flex;gap:14px;flex-wrap:wrap;
-        font-family:sans-serif;margin-top:6px;
-    '>
+    <div style='background:#13131f;border:1px solid #333;border-radius:12px;
+                padding:14px;display:flex;gap:14px;flex-wrap:wrap;
+                font-family:sans-serif;margin-top:6px;'>
         <img src="{img_src}"
              style='width:150px;height:200px;object-fit:cover;border-radius:8px;flex-shrink:0;'
              onerror="this.src='https://placehold.co/150x200/1a1a2e/888?text=No+Image'"/>
@@ -306,45 +323,35 @@ def format_detail_html(result):
             <div style='font-size:1.05em;font-weight:bold;color:#e0e0e0;margin-bottom:2px;'>
                 {nsfw_badge}{result["name"]}
             </div>
-            <div style='font-size:0.78em;color:#666;margin-bottom:10px;'>{result["version_name"]}</div>
-
-            <div style='display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:0.83em;'>
+            <div style='font-size:0.78em;color:#555;margin-bottom:10px;'>{result["version_name"]}</div>
+            <div style='display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:0.82em;'>
                 <span style='color:#666;'>👤 Creator</span>
                 <span style='color:#ccc;'>{result["creator"]}</span>
-
-                <span style='color:#666;'>🏗️ Base</span>
-                <span>
-                    <span style='background:#1a2a3a;color:#7ab;padding:1px 7px;border-radius:6px;font-size:0.9em;'>
-                        {result["base_model"]}
-                    </span>
+                <span style='color:#666;'>🏗️ Base Model</span>
+                <span style='background:#1a2a3a;color:#7ab;padding:1px 7px;
+                             border-radius:6px;font-size:0.88em;'>
+                    {result["base_model"]}
                 </span>
-
                 <span style='color:#666;'>⬇️ Downloads</span>
                 <span style='color:#ccc;'>{result["downloads"]:,}</span>
-
                 <span style='color:#666;'>⭐ Rating</span>
-                <span style='color:#ccc;'>
-                    {result["rating"]}
+                <span style='color:#ccc;'>{result["rating"]}
                     <span style='color:#555;font-size:0.88em;'>({result["rating_count"]} reviews)</span>
                 </span>
-
                 <span style='color:#666;'>💾 Size</span>
                 <span style='color:#ccc;'>{size_str}</span>
-
                 <span style='color:#666;'>📄 File</span>
-                <span style='color:#aaa;font-size:0.82em;word-break:break-all;'>{fname}</span>
+                <span style='color:#999;font-size:0.82em;word-break:break-all;'>{fname}</span>
             </div>
-
             {trigger_section}
-
-            <div style='margin-top:10px;font-size:0.78em;color:#777;line-height:1.6;'>
+            <div style='margin-top:10px;font-size:0.78em;color:#666;line-height:1.6;'>
                 {result["description"]}
             </div>
-
             <a href='{result["model_url"]}' target='_blank'
-               style='display:inline-block;margin-top:12px;color:#7c6af7;font-size:0.83em;text-decoration:none;'>
+               style='display:inline-block;margin-top:12px;color:#7c6af7;
+                      font-size:0.83em;text-decoration:none;'>
                 🔗 View on Civitai →
             </a>
         </div>
     </div>"""
-        
+    
