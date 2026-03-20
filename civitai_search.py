@@ -1,18 +1,15 @@
 """
 civitai_search.py — Civitai LoRA Search for DiffuseCraft
 
-Based on official Civitai REST API Reference (updated Dec 2025):
-https://github.com/civitai/civitai/wiki/REST-API-Reference#get-apiv1models
-
-GET /api/v1/models params:
-  limit, page, query, tag, username, types, sort, period, nsfw
-  sort values: "Most Reactions", "Most Comments", "Newest", "Most Downloaded"
-  period values: "AllTime", "Year", "Month", "Week", "Day"
-  nsfw: boolean true/false
-
-Image CDN: imagecache.civitai.com/.../width=N/filename for compression
-
-Auth: Bearer token in header + ?token= in download URLs (S3 strips headers)
+Confirmed working params from official API docs + civitai-api Python wrapper:
+- 'limit' is the correct page size param (NOT pageSize)
+- 'query' works for name search
+- 'username' works for creator search  
+- sort: "Most Reactions", "Most Comments", "Newest", "Most Downloaded"
+- period: "AllTime", "Year", "Month", "Week", "Day" (only used without query)
+- nsfw: true/false
+- The 400 error was caused by combining sort+period+query together
+  Fix: only send period when NOT using query param
 """
 
 import requests
@@ -20,12 +17,13 @@ import subprocess
 import os
 import re
 
-CIVITAI_API = "https://civitai.com/api/v1/models"
-PAGE_SIZE   = 10
+CIVITAI_API  = "https://civitai.com/api/v1/models"
+PAGE_SIZE    = 10
+SORT_OPTIONS = ["Most Downloaded", "Most Reactions", "Newest"]
 
 
 def compress_image_url(url, width=180):
-    """Resize via Civitai's imagecache CDN."""
+    """Resize via Civitai imagecache CDN."""
     if not url:
         return url
     if "imagecache.civitai.com" in url:
@@ -36,13 +34,19 @@ def compress_image_url(url, width=180):
     return url
 
 
-def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SIZE):
+def _do_request(params, headers):
+    """Make a single API request, return parsed JSON or raise."""
+    resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SIZE, sort="Most Downloaded"):
     """
-    Search Civitai for LoRAs using the official API.
-    - Name:    uses 'query' param (correct per official docs)
-    - Creator: uses 'username' param
-    sort='Most Downloaded', period='AllTime', nsfw=true
-    Returns (results, status_message, total_pages).
+    Search Civitai for LoRAs.
+    Name search: tries query first, falls back to tag if empty.
+    Creator search: uses username param.
+    Key: do NOT send period when using query (causes 400).
     """
     headers = {}
     if api_key and api_key.strip():
@@ -50,62 +54,56 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
 
     q = query.strip()
 
-    # Base params — only valid values per official docs
-    params = {
-        "types":  "LORA",
-        "limit":  page_size,
-        "page":   page,
-        "sort":   "Most Downloaded",
-        "period": "AllTime",
-        "nsfw":   "true",
+    # Base params — no period when using query (causes 400 on Civitai API)
+    base = {
+        "types": "LORA",
+        "limit": page_size,
+        "page":  page,
+        "sort":  sort,
+        "nsfw":  "true",
     }
 
-    if search_by == "Creator":
-        params["username"] = q
-    else:
-        params["query"] = q
+    data     = None
+    used_tag = False
 
-    try:
-        resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code
-        # If 400, retry without period param (some older API versions don't like it with query)
-        if status == 400:
-            params.pop("period", None)
+    if search_by == "Creator":
+        # Creator: period is safe to include
+        try:
+            data = _do_request({**base, "period": "AllTime", "username": q}, headers)
+        except Exception as e:
+            return [], f"❌ Search failed: {e}", 1
+    else:
+        # Name: query param only, NO period
+        try:
+            data = _do_request({**base, "query": q}, headers)
+        except requests.exceptions.HTTPError as e:
+            # If still 400, strip sort too and try bare minimum
+            if e.response.status_code == 400:
+                try:
+                    data = _do_request({"types": "LORA", "limit": page_size,
+                                        "page": page, "query": q, "nsfw": "true"}, headers)
+                except Exception as e2:
+                    return [], f"❌ Search failed: {e2}", 1
+            else:
+                return [], f"❌ Search failed: {e}", 1
+        except Exception as e:
+            return [], f"❌ Search failed: {e}", 1
+
+        # Fallback to tag search if query returns nothing
+        if not data or not data.get("items"):
             try:
-                resp = requests.get(CIVITAI_API, params=params, headers=headers, timeout=15)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e2:
-                return [], f"❌ Search failed: {e2}", 1
-        else:
-            return [], f"❌ Search failed ({status}): {e}", 1
-    except Exception as e:
-        return [], f"❌ Search failed: {e}", 1
+                data = _do_request({**base, "tag": q}, headers)
+                used_tag = True
+            except Exception:
+                pass
+
+    if not data:
+        return [], f"No results for '{q}'.", 1
 
     items       = data.get("items", [])
     metadata    = data.get("metadata", {})
     total_pages = max(1, metadata.get("totalPages", 1))
     total_items = metadata.get("totalItems", len(items))
-
-    if not items:
-        # Fallback: try tag search if query returned nothing
-        if search_by != "Creator":
-            try:
-                params2 = dict(params)
-                params2.pop("query", None)
-                params2["tag"] = q
-                resp2 = requests.get(CIVITAI_API, params=params2, headers=headers, timeout=15)
-                resp2.raise_for_status()
-                data2       = resp2.json()
-                items       = data2.get("items", [])
-                metadata    = data2.get("metadata", {})
-                total_pages = max(1, metadata.get("totalPages", 1))
-                total_items = metadata.get("totalItems", len(items))
-            except Exception:
-                pass
 
     if not items:
         return [], f"No LoRAs found for '{q}'. Try different keywords.", 1
@@ -130,7 +128,6 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
         if not download_url:
             download_url = latest.get("downloadUrl", "")
 
-        # Compressed preview image (180px wide)
         images      = latest.get("images", [])
         raw_preview = next((img["url"] for img in images if img.get("url")), "")
         preview_url = compress_image_url(raw_preview, width=180)
@@ -158,22 +155,18 @@ def search_civitai_loras(query, search_by, api_key="", page=1, page_size=PAGE_SI
             "nsfw":          item.get("nsfw", False),
         })
 
-    msg = f"✅ Page {page}/{total_pages} — {total_items:,} total results for '{q}'"
+    tag_note = " (tag search)" if used_tag else ""
+    msg = f"✅ Page {page}/{total_pages} — {total_items:,} results for '{q}'{tag_note}"
     return results, msg, total_pages
 
 
 def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
-    """
-    Download LoRA using aria2c (same as DiffuseCraft), falls back to requests.
-    Token passed as ?token= in URL (required for S3 redirects) AND in header.
-    """
+    """Download using aria2c (same as DiffuseCraft). Token as ?token= param."""
     os.makedirs(directory, exist_ok=True)
-
     url = result.get("download_url", "")
     if not url:
-        return None, "❌ No download URL available."
+        return None, "❌ No download URL."
 
-    # Must add token as query param — S3 redirects strip headers
     if civitai_api_key and civitai_api_key.strip() and "token=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}token={civitai_api_key.strip()}"
@@ -187,29 +180,24 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
     output_path = os.path.join(directory, filename)
     print(f"[CivitaiSearch] Downloading {filename} → {directory}")
 
-    # aria2c first (same as DiffuseCraft download_things)
     try:
-        cmd = [
-            "aria2c", "--console-log-level=error",
-            "-c", "-x", "16", "-s", "16", "-k", "1M",
-            "--out", filename, url, "-d", directory,
-        ]
+        cmd = ["aria2c", "--console-log-level=error", "-c", "-x", "16", "-s", "16",
+               "-k", "1M", "--out", filename, url, "-d", directory]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode == 0 and os.path.exists(output_path):
             return output_path, f"✅ Downloaded: {filename}\nPath: {output_path}"
     except FileNotFoundError:
         pass
 
-    # Fallback: requests streaming
     try:
-        hdrs = {"User-Agent": "DiffuseCraft/1.0"}
-        with requests.get(url, headers=hdrs, stream=True, timeout=120) as r:
+        with requests.get(url, headers={"User-Agent": "DiffuseCraft/1.0"},
+                          stream=True, timeout=120) as r:
             r.raise_for_status()
             cd = r.headers.get("Content-Disposition", "")
             if "filename=" in cd:
                 import cgi
-                _, cgi_params = cgi.parse_header(cd)
-                srv = cgi_params.get("filename", "").strip('"')
+                _, p = cgi.parse_header(cd)
+                srv = p.get("filename", "").strip('"')
                 if srv.endswith(".safetensors"):
                     filename    = srv
                     output_path = os.path.join(directory, filename)
@@ -222,7 +210,6 @@ def download_lora_from_result(result, directory="./loras", civitai_api_key=""):
 
 
 def format_results_html(results, current_page=1, total_pages=1):
-    """3-per-row card grid with compressed preview images and internal scroll."""
     if not results:
         return "<p style='color:#aaa;padding:10px;'>No results.</p>"
 
@@ -249,9 +236,8 @@ def format_results_html(results, current_page=1, total_pages=1):
              onmouseover="this.style.borderColor='#7c6af7';this.style.transform='scale(1.03)';"
              onmouseout="this.style.borderColor='#2a2a3e';this.style.transform='scale(1)';">
             <div style="position:relative;">
-                <img src="{img_src}"
+                <img src="{img_src}" loading="lazy"
                      style="width:100%;height:185px;object-fit:cover;display:block;"
-                     loading="lazy"
                      onerror="this.src='https://placehold.co/140x185/1a1a2e/888?text=No+Image'"/>
                 <div style="position:absolute;top:5px;left:5px;background:rgba(0,0,0,0.8);
                             color:#fff;font-size:0.72em;font-weight:bold;
@@ -283,7 +269,6 @@ def format_results_html(results, current_page=1, total_pages=1):
 
 
 def format_detail_html(result):
-    """Full detail card with trigger words, stats, preview image."""
     if not result:
         return ""
 
@@ -296,8 +281,8 @@ def format_detail_html(result):
         ])
         trigger_section = f"""
         <div style='margin-top:12px;'>
-            <div style='color:#888;font-size:0.8em;font-weight:bold;
-                        letter-spacing:0.05em;margin-bottom:5px;'>🎯 TRIGGER WORDS</div>
+            <div style='color:#888;font-size:0.8em;font-weight:bold;margin-bottom:5px;'>
+                🎯 TRIGGER WORDS</div>
             <div>{tags}</div>
         </div>"""
     else:
@@ -321,23 +306,19 @@ def format_detail_html(result):
              onerror="this.src='https://placehold.co/150x200/1a1a2e/888?text=No+Image'"/>
         <div style='flex:1;min-width:160px;'>
             <div style='font-size:1.05em;font-weight:bold;color:#e0e0e0;margin-bottom:2px;'>
-                {nsfw_badge}{result["name"]}
-            </div>
+                {nsfw_badge}{result["name"]}</div>
             <div style='font-size:0.78em;color:#555;margin-bottom:10px;'>{result["version_name"]}</div>
             <div style='display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:0.82em;'>
                 <span style='color:#666;'>👤 Creator</span>
                 <span style='color:#ccc;'>{result["creator"]}</span>
                 <span style='color:#666;'>🏗️ Base Model</span>
-                <span style='background:#1a2a3a;color:#7ab;padding:1px 7px;
-                             border-radius:6px;font-size:0.88em;'>
-                    {result["base_model"]}
-                </span>
+                <span style='background:#1a2a3a;color:#7ab;padding:1px 7px;border-radius:6px;font-size:0.88em;'>
+                    {result["base_model"]}</span>
                 <span style='color:#666;'>⬇️ Downloads</span>
                 <span style='color:#ccc;'>{result["downloads"]:,}</span>
                 <span style='color:#666;'>⭐ Rating</span>
                 <span style='color:#ccc;'>{result["rating"]}
-                    <span style='color:#555;font-size:0.88em;'>({result["rating_count"]} reviews)</span>
-                </span>
+                    <span style='color:#555;font-size:0.88em;'>({result["rating_count"]} reviews)</span></span>
                 <span style='color:#666;'>💾 Size</span>
                 <span style='color:#ccc;'>{size_str}</span>
                 <span style='color:#666;'>📄 File</span>
@@ -345,13 +326,10 @@ def format_detail_html(result):
             </div>
             {trigger_section}
             <div style='margin-top:10px;font-size:0.78em;color:#666;line-height:1.6;'>
-                {result["description"]}
-            </div>
+                {result["description"]}</div>
             <a href='{result["model_url"]}' target='_blank'
-               style='display:inline-block;margin-top:12px;color:#7c6af7;
-                      font-size:0.83em;text-decoration:none;'>
-                🔗 View on Civitai →
-            </a>
+               style='display:inline-block;margin-top:12px;color:#7c6af7;font-size:0.83em;text-decoration:none;'>
+                🔗 View on Civitai →</a>
         </div>
     </div>"""
-    
+          
